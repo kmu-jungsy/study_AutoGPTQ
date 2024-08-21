@@ -1,3 +1,13 @@
+# @misc{kang2024gear,
+#       title={GEAR: An Efficient KV Cache Compression Recipe for Near-Lossless Generative Inference of LLM}, 
+#       author={Hao Kang and Qingru Zhang and Souvik Kundu and Geonhwa Jeong and Zaoxing Liu and Tushar Krishna and Tuo Zhao},
+#       year={2024},
+#       eprint={2403.05527},
+#       archivePrefix={arXiv},
+#       primaryClass={cs.LG}
+# }
+
+
 import math
 import warnings
 from typing import List, Optional, Tuple
@@ -7,7 +17,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from quant.new_pack import triton_quantize_and_pack_along_last_dim
-from quant.matmul import cuda_bmm_fA_qB_outer
 
 from transformers.models.llama.configuration_llama import *
 from transformers.models.llama.modeling_llama import *
@@ -81,10 +90,8 @@ class LlamaAttention_KIVI(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -137,22 +144,10 @@ class LlamaAttention_KIVI(nn.Module):
             value_scale = past_key_value[6]
             value_mn = past_key_value[7]
 
-            if key_states_quant_trans is not None:
-                # print("key_states_quant_trans",key_states_quant_trans.shape)
-                att_qkquant = cuda_bmm_fA_qB_outer(self.group_size, query_states, key_states_quant_trans, 
-                                key_scale_trans, key_mn_trans, self.k_bits)
-            else:
-                att_qkquant = None
-
             if key_states_full is not None:
                 key_states_full = torch.cat([key_states_full, key_states], dim=2)
             else:
                 key_states_full = key_states
-            att_qkfull = torch.matmul(query_states, key_states_full.transpose(2, 3))
-            if att_qkquant is not None:
-                attn_weights = torch.cat([att_qkquant, att_qkfull], dim=-1) / math.sqrt(self.head_dim)
-            else:
-                attn_weights = att_qkfull / math.sqrt(self.head_dim)
 
             if key_states_full.shape[-2] == self.residual_length:
                 assert self.residual_length % self.group_size == 0
@@ -169,33 +164,8 @@ class LlamaAttention_KIVI(nn.Module):
                     key_scale_trans = key_scale_trans_new
                     key_mn_trans = key_mn_trans_new
 
-            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                    f" {attn_weights.size()}"
-                )
-
-            if attention_mask is not None:
-                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                    raise ValueError(
-                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                    )
-                attn_weights = attn_weights + attention_mask
-                attn_weights = torch.max(
-                    attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
-                )
-
-            # upcast attention to fp32
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
             value_states_full = torch.cat([value_states_full, value_states], dim=2)
             value_full_length = value_states_full.shape[-2]
-            if value_states_quant is None:
-                attn_output = torch.matmul(attn_weights, value_states_full)
-            else:
-                attn_output = cuda_bmm_fA_qB_outer(self.group_size, attn_weights[:, :, :, :-value_full_length], value_states_quant, 
-                                                value_scale, value_mn, self.v_bits)
-                attn_output += torch.matmul(attn_weights[:, :, :, -value_full_length:], value_states_full)
             
             if value_full_length > self.residual_length:
                 assert value_full_length == self.residual_length + 1
@@ -213,10 +183,9 @@ class LlamaAttention_KIVI(nn.Module):
                     value_mn = mn
 
         else:
-            attn_weights = torch.matmul(query_states, 
-                                        key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            
             # quantize
-            if key_states.shape[-2] % self.residual_length != 0:
+            if key_states.shape[-2] % self.residual_length != 0: # key 는 B, nh, seq_len, head_dim
                 if key_states.shape[-2] < self.residual_length:
                     key_states_quant = None
                     key_states_full = key_states
@@ -227,6 +196,7 @@ class LlamaAttention_KIVI(nn.Module):
                 key_states_quant = key_states
                 key_states_full = None
             if key_states_quant is not None:
+                # print(past_key_value is None) # True
                 key_states_quant_trans, key_scale_trans, key_mn_trans = triton_quantize_and_pack_along_last_dim(key_states_quant.transpose(2, 3).contiguous(), self.group_size, self.k_bits)
             else:
                 key_states_quant_trans = None
@@ -245,50 +215,9 @@ class LlamaAttention_KIVI(nn.Module):
                                                                                                 self.group_size, 
                                                                                                 self.v_bits)
 
-            if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                    f" {attn_weights.size()}"
-                )
-
-            if attention_mask is not None:
-                if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                    raise ValueError(
-                        f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                    )
-                attn_weights = attn_weights + attention_mask
-                attn_weights = torch.max(
-                    attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
-                )
-
-            # upcast attention to fp32
-            attn_weights = nn.functional.softmax(
-                attn_weights, dim=-1, dtype=torch.float32
-            ).to(query_states.dtype)
-
-            attn_output = torch.matmul(attn_weights, value_states) 
         past_key_value = (key_states_quant_trans, key_states_full, key_scale_trans, key_mn_trans, value_states_quant, value_states_full, value_scale, value_mn, kv_seq_len) if use_cache else None
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output)
-
-        attn_weights = None
-        return attn_output, attn_weights, past_key_value
-
-
-
+        return None, None, past_key_value
     
 
 class LlamaDecoderLayer_KIVI(nn.Module):
@@ -303,7 +232,7 @@ class LlamaDecoderLayer_KIVI(nn.Module):
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -347,9 +276,9 @@ class LlamaDecoderLayer_KIVI(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
 
-        # Fully Connected
+        hidden_states = residual
+
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -424,7 +353,8 @@ class LlamaModel_KIVI(LlamaPreTrainedModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         past_key_values_length = 0
-        if past_key_values is not None and len(past_key_values) > 0:
+        is_past_key_values = past_key_values is not None and len(past_key_values) > 0
+        if is_past_key_values:
             past_key_values_length = past_key_values[0][-1]
 
         if position_ids is None:
@@ -465,7 +395,7 @@ class LlamaModel_KIVI(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None  and len(past_key_values) > 0 else None
+            past_key_value = past_key_values[idx] if is_past_key_values else None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -638,7 +568,8 @@ class LlamaForCausalLM_KIVI(LlamaPreTrainedModel):
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        if past_key_values is not None and len(past_key_values) > 0:
+        is_past_key_values = past_key_values is not None and len(past_key_values) > 0
+        if is_past_key_values:
             past_length = past_key_values[0][-1]
             # Some generation methods already pass only the last input ID
             if input_ids.shape[1] > past_length:
@@ -654,11 +585,11 @@ class LlamaForCausalLM_KIVI(LlamaPreTrainedModel):
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
+            if is_past_key_values:
                 position_ids = position_ids[:, -input_ids.shape[1] :]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
+        if inputs_embeds is not None and is_past_key_values == False:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}

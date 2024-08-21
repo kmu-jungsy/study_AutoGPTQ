@@ -1,10 +1,18 @@
 import argparse
-import os
+import sys, os
 
-import torch
-from transformers import AutoTokenizer
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))))
 
 from auto_gptq.utils import Perplexity
+
+
+from modeling_llamagear import LlamaForCausalLM_GEARKIVI
+from UniformAndGroupQuantization import LlamaForCausalLM_KIVI
+from transformers import LlamaConfig, AutoTokenizer, LlamaForCausalLM
+from transformers import BitsAndBytesConfig
+from datasets import load_dataset
+import torch
+import argparse
 
 
 if __name__ == "__main__":
@@ -25,7 +33,7 @@ if __name__ == "__main__":
 
     """
     parser = argparse.ArgumentParser(description="Calculate Perplexity for a model.")
-    parser.add_argument("--model_name", type=str, default="gpt2", help="Model name.")
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-2-7b", help="Model name.")
     parser.add_argument("--model_basename", type=str, default=None, help="Model file's basename.")
     parser.add_argument("--n_ctx", type=int, default=512, help="Context size.")
     parser.add_argument("--n_batch", type=int, default=512, help="Batch size.")
@@ -45,7 +53,6 @@ if __name__ == "__main__":
         help="Max memory used in each GPU.",
     )
     parser.add_argument("--cpu_max_memory", type=int, default=None, help="Mx memory used in CPU.")
-    parser.add_argument("--is_quantized", action="store_true", help="Is the model GPTQ quantized?")
     parser.add_argument(
         "--use_safetensors",
         action="store_true",
@@ -62,10 +69,6 @@ if __name__ == "__main__":
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=args.use_fast_tokenizer)
-    if not tokenizer.pad_token_id:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
     max_memory = {}
     if args.per_gpu_max_memory is not None and args.per_gpu_max_memory > 0:
         if torch.cuda.is_available():
@@ -80,32 +83,63 @@ if __name__ == "__main__":
             "The argument --use_safetensors is deprecrated and will be removed in the next release. It is now the default behavior."
         )
 
-    if args.is_quantized:
-        from auto_gptq import AutoGPTQForCausalLM
+    config = LlamaConfig.from_pretrained("meta-llama/Llama-2-7b-hf")
 
-        model = AutoGPTQForCausalLM.from_quantized(
-            args.model_name,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            max_memory=max_memory,
-            model_basename=args.model_basename,
-            use_safetensors=True,
-            trust_remote_code=args.trust_remote_code,
-            inject_fused_mlp=False,
-            inject_fused_attention=False,
-            disable_exllama=args.disable_exllama,
-        )
-    else:
-        from transformers import AutoModelForCausalLM
+    config.k_bits = 2# current support 2/4 bit for KV Cache
+    config.v_bits = 2 # current support 2/4 bit for KV Cache
+    config.group_size = 64
+    config.residual_length = 64 # the number of recent fp16 tokens
 
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            max_memory=max_memory,
+    batch_size = args.n_batch
+
+    ##### Config for 
+    compress_config = {}
+    compress_config["compress_method"] = "gearlKIVI" # "gearlKIVI" "gearsKIVI"
+    compress_config["group_size"] = 64
+    compress_config["residual"] = 64
+    compress_config["quantize_bit"] = 2
+    compress_config["rank"] = 2 ## prefill rank
+    compress_config["rankv"] = 2 ## prefill rank
+    compress_config["loop"] = 3
+    # compress_config["stream_list"] = stream_list
+    stream_list = [torch.cuda.Stream(),torch.cuda.Stream()]
+
+    args.model = "None"
+
+    if "gearl" in args.model:
+        model = LlamaForCausalLM_GEARKIVI.from_pretrained(
+            "meta-llama/Llama-2-7b-hf",
+            config = config,
+            # quantization_config = quantization_config,
+            compress_config = compress_config,
             torch_dtype=torch.float16,
-            trust_remote_code=args.trust_remote_code,
+            device_map = "cuda:0"
         )
+    elif "KIVI" in args.model:
+        model = LlamaForCausalLM_KIVI.from_pretrained(
+            "meta-llama/Llama-2-7b-hf",
+            config = config,
+            # quantization_config = quantization_config,
+            # compress_config = compress_config,
+            torch_dtype=torch.float16,
+            device_map = "cuda:0"
+        )
+    elif "None" in args.model:
+        model = LlamaForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-7b-hf",
+        torch_dtype=torch.float16,
+        device_map = "cuda:0")
+    model = model.half()
+
+    max_token = args.n_ctx
+    tokenizer = AutoTokenizer.from_pretrained(
+        'meta-llama/Llama-2-7b-hf', 
+        model_max_length=max_token,
+        max_length=max_token,
+        use_fast=False, 
+        trust_remote_code=True, 
+        tokenizer_type='llama')
+    tokenizer.pad_token = tokenizer.eos_token
 
     ppl = Perplexity(
         model,
